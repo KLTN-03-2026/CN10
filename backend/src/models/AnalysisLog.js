@@ -30,6 +30,12 @@ const AnalysisLogSchema = new mongoose.Schema(
       index: true,
       // Workflow head branch (main, feature/*, fix/*, hotfix/*)
     },
+    baseBranch: {
+      type: String,
+      default: null,
+      index: true,
+      // Workflow base/target branch where fixes should be merged (main, master, develop, etc.)
+    },
     prNumber: {
       type: Number,
       default: null,
@@ -55,6 +61,24 @@ const AnalysisLogSchema = new mongoose.Schema(
         // Can include code snippet or configuration change
       },
     },
+    suggestedFixText: {
+      type: String,
+      default: null,
+      // Human-readable fix guidance shown in the UI
+    },
+    patchFiles: [
+      {
+        filePath: {
+          type: String,
+          required: true,
+          trim: true,
+        },
+        fileContent: {
+          type: String,
+          required: true,
+        },
+      },
+    ],
     reasoning_trace: {
       type: String,
       default: null,
@@ -86,12 +110,13 @@ const AnalysisLogSchema = new mongoose.Schema(
       // - Similarity search (find similar past errors)
       // - RAG retrieval (augment AI context with similar cases)
       // - Clustering analysis (group related errors)
-      index: "2dsphere", // Optional: spatial index for vector similarity
+      // NOTE: Vector search index must be created via Atlas UI/CLI
+      //       (type: "vectorSearch"), NOT as a Mongoose schema index.
     },
     status: {
       type: String,
-      enum: ["PENDING", "COMPLETED", "PR_CREATED", "FAILED"],
-      default: "COMPLETED",
+      enum: ["QUEUED", "PROCESSING", "PENDING", "COMPLETED", "PR_CREATED", "FAILED"],
+      default: "QUEUED",
     },
     errorMessage: {
       type: String,

@@ -4,9 +4,15 @@ const {
   getAdminHistory,
   getAdminUsers,
   updateUserRole,
+  updateUserAccess,
+  getFinanceSummary,
+  getAdminRevenue,
   getFeedbackTickets,
   resolveFeedbackTicket,
   syncAiKnowledge,
+  getSystemStats,
+  getGlobalLogs,
+  getAuditLogs,
 } = require("../controllers/adminController");
 
 const router = express.Router();
@@ -32,6 +38,24 @@ router.get("/users", getAdminUsers);
 router.put("/users/:id/role", updateUserRole);
 
 /**
+ * PUT /api/admin/users/:id/access
+ * Update user role/tier in one operation.
+ */
+router.put("/users/:id/access", updateUserAccess);
+
+/**
+ * GET /api/admin/finance/summary
+ * Get finance KPI snapshot.
+ */
+router.get("/finance/summary", getFinanceSummary);
+
+/**
+ * GET /api/admin/revenue
+ * Aggregate completed transactions and recent PRO upgrades.
+ */
+router.get("/revenue", getAdminRevenue);
+
+/**
  * GET /api/admin/feedback
  * Fetch all feedback tickets.
  */
@@ -48,6 +72,24 @@ router.put("/feedback/:id/resolve", resolveFeedbackTicket);
  * Trigger mock AI synchronization process.
  */
 router.post("/sync-ai", syncAiKnowledge);
+
+/**
+ * GET /api/admin/stats
+ * System-wide statistics snapshot.
+ */
+router.get("/stats", getSystemStats);
+
+/**
+ * GET /api/admin/logs
+ * Global analysis logs with optional ?status filter.
+ */
+router.get("/logs", getGlobalLogs);
+
+/**
+ * GET /api/admin/audit-logs/:userId
+ * Audit trail for a specific user.
+ */
+router.get("/audit-logs/:userId", getAuditLogs);
 
 /**
  * Compatibility aliases for existing frontend clients.

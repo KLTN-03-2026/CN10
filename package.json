@@ -1,0 +1,8 @@
+{
+  "name": "cn10-workspace",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ]
+}

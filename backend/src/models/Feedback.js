@@ -27,6 +27,11 @@ const FeedbackSchema = new mongoose.Schema(
       trim: true,
       maxlength: 5000,
     },
+    clientReadAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
   },
   {
     timestamps: true,

@@ -1,4 +1,49 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const KnowledgeBase = require("../models/KnowledgeBase");
+
+const buildSearchText = (logs, context = {}) => {
+  const explicitError =
+    typeof context.errorMessage === "string" ? context.errorMessage.trim() : "";
+
+  if (explicitError) {
+    return explicitError;
+  }
+
+  return String(logs || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 40)
+    .join(" ")
+    .slice(0, 1200);
+};
+
+const fetchKnowledgeContext = async (searchText) => {
+  if (!searchText || !searchText.trim()) {
+    return "";
+  }
+
+  const docs = await KnowledgeBase.find(
+    { $text: { $search: searchText } },
+    { score: { $meta: "textScore" }, title: 1, content: 1, sourceUrl: 1 },
+  )
+    .sort({ score: { $meta: "textScore" } })
+    .limit(2)
+    .lean();
+
+  if (!docs.length) {
+    return "";
+  }
+
+  return docs
+    .map(
+      (doc, index) =>
+        `[Doc ${index + 1}] ${doc.title}\nSource: ${doc.sourceUrl}\n${String(
+          doc.content || "",
+        ).slice(0, 1500)}`,
+    )
+    .join("\n\n");
+};
 
 function analyzeWithHeuristics(logs, context = {}) {
   const branchName = context.branchName || "main";
@@ -66,10 +111,9 @@ function analyzeWithHeuristics(logs, context = {}) {
       reasoning_trace:
         "Matched known failure signature from heuristic rule-set.",
       rootCause: matched.rootCause,
-      suggestedFix: `${matched.suggestedFix}${featureBranchHint}`,
-      targetFile: null,
+      suggestedFixText: `${matched.suggestedFix}${featureBranchHint}`,
       severity: matched.severity,
-      summary: "Generated using fallback log heuristics.",
+      patchFiles: [],
     };
   }
 
@@ -78,12 +122,11 @@ function analyzeWithHeuristics(logs, context = {}) {
       "No deterministic pattern match found; returning generalized remediation guidance.",
     rootCause:
       "Unable to determine an exact root cause from logs automatically. The failure appears to be workflow/environment related.",
-    suggestedFix: isFeatureBranch
+    suggestedFixText: isFeatureBranch
       ? "Inspect the first error stack trace in job logs, apply the smallest safe patch on the feature branch, and prepare a PR-ready fix with clear review notes."
       : "Inspect the first error stack trace in job logs, verify secrets/env vars, pin tool versions, and retry with debug logging enabled.",
-    targetFile: null,
     severity: "MEDIUM",
-    summary: "Generated using fallback log heuristics.",
+    patchFiles: [],
   };
 }
 
@@ -92,7 +135,7 @@ function analyzeWithHeuristics(logs, context = {}) {
  * @param {string} logs - Raw CI/CD workflow logs
  * @param {string} customApiKey - Optional Gemini API key from user request header
  * @param {Object} context - Workflow context (branchName, prNumber)
- * @returns {Promise<Object>} Structured analysis with rootCause and suggestedFix
+ * @returns {Promise<Object>} Structured analysis with rootCause, suggestedFixText, and patchFiles
  */
 const analyzeLogsWithAI = async (logs, customApiKey, context = {}) => {
   try {
@@ -108,39 +151,54 @@ const analyzeLogsWithAI = async (logs, customApiKey, context = {}) => {
     }
 
     const client = new GoogleGenerativeAI(API_KEY_TO_USE);
+    const tier = context.tier === "PRO" ? "PRO" : "FREE";
+    const modelName = "gemini-2.5-flash";
 
-    const model = client.getGenerativeModel({ model: "gemini-2.5-flash" });
+    const model = client.getGenerativeModel({ model: modelName });
 
     const branchName = context.branchName || "main";
     const prNumber = context.prNumber || null;
+    const searchText = buildSearchText(logs, context);
+    const verifiedDocsContext = await fetchKnowledgeContext(searchText);
     const isFeatureBranch =
       typeof branchName === "string" &&
       branchName !== "main" &&
       !branchName.startsWith("release/");
 
-    const prompt = `You are an Expert DevSecOps Engineer and CI/CD Pipeline Debugger. 
-Analyze the following workflow logs to identify failures.
+    const ragPrefix = verifiedDocsContext
+      ? `Use the following verified DevSecOps documentation to formulate your fix:\n${verifiedDocsContext}\n\n`
+      : "";
+
+    const prompt = `${ragPrefix}You are an Expert DevSecOps Engineer and CI/CD Pipeline Debugger.
+  Analyze the following workflow logs to identify failures and generate a machine-readable patch plan.
 
   GitHub Flow context:
   - branchName: ${branchName}
   - prNumber: ${prNumber || "none"}
   - isFeatureBranch: ${isFeatureBranch ? "yes" : "no"}
+  - userTier: ${tier}
 
   If isFeatureBranch is yes, prioritize recommendations that are minimal, review-friendly, and safe for Pull Request review before merging to main.
 
-CRITICAL INSTRUCTION: You must analyze the logs step-by-step. First, document your investigation in the "reasoning_trace" field. Then, explicitly define the root cause, actionable fix, and severity.
-
-Format your response as a strictly valid JSON object with these exact keys:
+CRITICAL INSTRUCTION: Return ONLY valid JSON. No markdown fences, no commentary, no prose outside JSON.
+CRITICAL INSTRUCTION: The JSON must match this exact shape and key names:
 {
-  "reasoning_trace": "Step-by-step technical analysis of the stack trace and error codes...",
-  "rootCause": "Precise identification of the failing component or logic",
-  "suggestedFix": "Concrete code snippet or configuration change to resolve the error",
-  "targetFile": "Repository-relative file path to modify (e.g. src/index.js), or null if unknown",
-  "severity": "CRITICAL|HIGH|MEDIUM|LOW",
-  "summary": "One-sentence executive summary of the issue"
+  "reasoning_trace": "Explanation of the root cause...",
+  "rootCause": "Short root cause summary",
+  "suggestedFixText": "Human readable instructions for the UI",
+  "severity": "HIGH",
+  "patchFiles": [
+    {
+      "filePath": "exact/relative/path/to/file.js",
+      "fileContent": "RAW_CODE_HERE"
+    }
+  ]
 }
 
-Do NOT include markdown formatting (such as json). Return ONLY the raw JSON object.
+CRITICAL INSTRUCTION: fileContent MUST be raw, executable code for that file.
+Do NOT include markdown code fences, language tags, or inline explanations in fileContent.
+Do NOT wrap fileContent in triple backticks.
+If no safe patch is known, return patchFiles as an empty array.
 
 Workflow Logs:
 ${logs}`;
@@ -148,27 +206,35 @@ ${logs}`;
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
 
-    // Parse JSON response (handle potential markdown formatting)
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error("Failed to parse AI response as JSON");
-    }
-
-    const analysis = JSON.parse(jsonMatch[0]);
+    const aiData = JSON.parse(responseText.replace(/```json\n|```/g, ""));
 
     // Validate response structure
-    if (!analysis.rootCause || !analysis.suggestedFix) {
+    if (!aiData.rootCause || !aiData.suggestedFixText) {
       throw new Error("AI response missing required fields");
     }
 
+    const patchFiles = Array.isArray(aiData.patchFiles)
+      ? aiData.patchFiles
+          .filter(
+            (file) =>
+              file &&
+              typeof file.filePath === "string" &&
+              file.filePath.trim().length > 0 &&
+              typeof file.fileContent === "string",
+          )
+          .map((file) => ({
+            filePath: file.filePath.trim(),
+            fileContent: file.fileContent,
+          }))
+      : [];
+
     console.log("✅ AI analysis completed successfully");
     return {
-      reasoning_trace: analysis.reasoning_trace || "",
-      rootCause: analysis.rootCause,
-      suggestedFix: analysis.suggestedFix,
-      targetFile: analysis.targetFile || null,
-      severity: analysis.severity || "MEDIUM",
-      summary: analysis.summary || "",
+      reasoning_trace: aiData.reasoning_trace || "",
+      rootCause: aiData.rootCause,
+      suggestedFixText: aiData.suggestedFixText,
+      severity: aiData.severity || "MEDIUM",
+      patchFiles,
     };
   } catch (error) {
     console.error("Error analyzing logs with AI:", error.message);

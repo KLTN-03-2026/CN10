@@ -2,17 +2,16 @@ const jwt = require("jsonwebtoken");
 
 /**
  * Authentication middleware
- * Verifies Bearer JWT and attaches decoded payload to req.user
+ * Verifies JWT from HttpOnly cookie and attaches decoded payload to req.user
  */
 const auth = (req, res, next) => {
   try {
-    const authorization = req.headers.authorization || "";
-    const [scheme, token] = authorization.split(" ");
+    const token = req.cookies?.jwt;
 
-    if (scheme !== "Bearer" || !token) {
+    if (!token) {
       return res.status(401).json({
         error: "Unauthorized",
-        message: "Missing or invalid Authorization header",
+        message: "Missing authentication cookie",
       });
     }
 

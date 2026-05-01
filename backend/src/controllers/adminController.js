@@ -1,7 +1,56 @@
 const mongoose = require("mongoose");
+const axios = require("axios");
 const User = require("../models/User");
 const AnalysisLog = require("../models/AnalysisLog");
 const Feedback = require("../models/Feedback");
+const KnowledgeBase = require("../models/KnowledgeBase");
+const Transaction = require("../models/Transaction");
+
+const DEFAULT_KB_SOURCE_URL =
+  "https://raw.githubusercontent.com/github/docs/main/README.md";
+
+const normalizeTags = (title, content) => {
+  const haystack = `${title} ${content}`.toLowerCase();
+  const dictionary = [
+    "devsecops",
+    "github-actions",
+    "security",
+    "workflow",
+    "ci-cd",
+    "compliance",
+    "dependencies",
+    "secrets",
+  ];
+
+  return dictionary.filter((tag) => haystack.includes(tag));
+};
+
+const parseMarkdownKnowledge = (markdown, sourceUrl) => {
+  if (!markdown || typeof markdown !== "string") {
+    return [];
+  }
+
+  const sections = markdown
+    .split(/\n(?=#{1,3}\s+)/g)
+    .map((section) => section.trim())
+    .filter(Boolean);
+
+  const documents = sections.map((section, index) => {
+    const lines = section.split("\n");
+    const heading = lines[0].match(/^#{1,3}\s+(.+)$/);
+    const title = heading?.[1]?.trim() || `Section ${index + 1}`;
+    const content = lines.slice(1).join("\n").trim() || section;
+
+    return {
+      title,
+      content,
+      sourceUrl,
+      tags: normalizeTags(title, content),
+    };
+  });
+
+  return documents.filter((doc) => doc.content.length > 0);
+};
 
 const normalizePagination = (query) => {
   const page = Math.max(parseInt(query.page, 10) || 1, 1);
@@ -58,7 +107,7 @@ const getAdminUsers = async (req, res) => {
 
     const [users, total] = await Promise.all([
       User.find({})
-        .select("_id username githubId avatar role createdAt updatedAt")
+        .select("_id username githubId avatar role tier createdAt updatedAt")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -110,12 +159,14 @@ const updateUserRole = async (req, res) => {
       });
     }
 
-    const updatedUser = await User.findByIdAndUpdate(
-      id,
-      { role },
-      { new: true, runValidators: true },
-    )
-      .select("_id username githubId avatar role createdAt updatedAt")
+    const updatePayload =
+      role === "ADMIN" ? { role, tier: "PRO", isFirstLogin: false } : { role };
+
+    const updatedUser = await User.findByIdAndUpdate(id, updatePayload, {
+      new: true,
+      runValidators: true,
+    })
+      .select("_id username githubId avatar role tier createdAt updatedAt")
       .lean();
 
     if (!updatedUser) {
@@ -205,6 +256,7 @@ const resolveFeedbackTicket = async (req, res) => {
       {
         status: "RESOLVED",
         adminReply: adminReply.trim(),
+        clientReadAt: null,
       },
       { new: true, runValidators: true },
     )
@@ -234,22 +286,217 @@ const resolveFeedbackTicket = async (req, res) => {
 
 /**
  * POST /api/admin/sync-ai
- * Mock RAG synchronization with 2-second delay.
+ * Synchronize public DevSecOps knowledge for lightweight RAG.
  */
 const syncAiKnowledge = async (req, res) => {
   try {
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    const totalLogs = await AnalysisLog.countDocuments({});
+    const sourceUrl = req.body?.sourceUrl || DEFAULT_KB_SOURCE_URL;
+    const response = await axios.get(sourceUrl, {
+      timeout: 15000,
+      headers: {
+        Accept: "text/plain, text/markdown, application/json",
+      },
+    });
+
+    const payload =
+      typeof response.data === "string"
+        ? response.data
+        : JSON.stringify(response.data, null, 2);
+
+    let docs = parseMarkdownKnowledge(payload, sourceUrl);
+
+    if (docs.length === 0) {
+      docs = [
+        {
+          title: "DevSecOps Sync Snapshot",
+          content: payload.slice(0, 12000),
+          sourceUrl,
+          tags: ["devsecops", "github-actions", "security"],
+        },
+      ];
+    }
+
+    await KnowledgeBase.deleteMany({});
+    const inserted = await KnowledgeBase.insertMany(docs, { ordered: true });
+    const syncedCount = inserted.length;
 
     return res.status(200).json({
       success: true,
-      message: `Successfully synchronized ${totalLogs} logs to the Vector Store.`,
+      syncedCount,
+      sourceUrl,
+      message: `Synchronized ${syncedCount} knowledge document(s).`,
     });
   } catch (error) {
     console.error("Error synchronizing AI knowledge:", error.message);
     return res.status(500).json({
       success: false,
       error: "Failed to synchronize AI knowledge",
+      details: error.message,
+    });
+  }
+};
+
+/**
+ * PUT /api/admin/users/:id/access
+ * Update role/tier with { role?: "USER"|"ADMIN", tier?: "FREE"|"PRO" }.
+ */
+const updateUserAccess = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role, tier } = req.body;
+    const requesterId = req.user?.userId || req.user?.id;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid user id",
+      });
+    }
+
+    const requestedRole = role ? String(role).toUpperCase() : undefined;
+    const requestedTier = tier ? String(tier).toUpperCase() : undefined;
+
+    if (requestedRole && !["USER", "ADMIN"].includes(requestedRole)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid role",
+      });
+    }
+
+    if (requestedTier && !["FREE", "PRO"].includes(requestedTier)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid tier",
+      });
+    }
+
+    const existingUser = await User.findById(id);
+    if (!existingUser) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+    }
+
+    if (
+      requesterId &&
+      requesterId.toString() === id.toString() &&
+      requestedRole === "USER"
+    ) {
+      return res.status(403).json({
+        success: false,
+        error: "You cannot demote your own admin account",
+      });
+    }
+
+    const nextRole = requestedRole || existingUser.role;
+    const nextTier =
+      nextRole === "ADMIN" ? "PRO" : requestedTier || existingUser.tier;
+
+    const updatePayload = {
+      role: nextRole,
+      tier: nextTier,
+    };
+
+    if (nextRole === "ADMIN") {
+      updatePayload.isFirstLogin = false;
+      updatePayload.analyzeCount = 0;
+      updatePayload.encryptedGeminiApiKey = null;
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(id, updatePayload, {
+      new: true,
+      runValidators: true,
+    })
+      .select("_id username githubId avatar role tier createdAt updatedAt")
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      user: updatedUser,
+    });
+  } catch (error) {
+    console.error("Error updating user access:", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to update user access",
+      details: error.message,
+    });
+  }
+};
+
+/**
+ * GET /api/admin/finance/summary
+ * Return admin financial snapshot derived from PRO user subscriptions.
+ */
+const getFinanceSummary = async (req, res) => {
+  try {
+    const monthlyPrice = Number(process.env.PRO_MONTHLY_PRICE_USD || 19);
+
+    const [proUsers, totalUsers] = await Promise.all([
+      User.countDocuments({ role: "USER", tier: "PRO" }),
+      User.countDocuments({ role: "USER" }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      finance: {
+        monthlyPriceUsd: monthlyPrice,
+        proUsers,
+        totalUsers,
+        totalProfitUsd: proUsers * monthlyPrice,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching finance summary:", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch finance summary",
+      details: error.message,
+    });
+  }
+};
+
+/**
+ * GET /api/admin/revenue
+ * Aggregate completed transactions for total revenue and show recent PRO users.
+ */
+const getAdminRevenue = async (req, res) => {
+  try {
+    const [revenueAgg, recentProUsers] = await Promise.all([
+      Transaction.aggregate([
+        { $match: { status: "COMPLETED" } },
+        {
+          $group: {
+            _id: null,
+            totalRevenue: { $sum: "$amount" },
+            totalTransactions: { $sum: 1 },
+          },
+        },
+      ]),
+      User.find({ role: "USER", tier: "PRO" })
+        .select("_id username avatar tier updatedAt")
+        .sort({ updatedAt: -1 })
+        .limit(10)
+        .lean(),
+    ]);
+
+    const snapshot = revenueAgg[0] || { totalRevenue: 0, totalTransactions: 0 };
+
+    return res.status(200).json({
+      success: true,
+      revenue: {
+        totalRevenue: Number(snapshot.totalRevenue || 0),
+        totalTransactions: Number(snapshot.totalTransactions || 0),
+        currency: "USD",
+      },
+      recentProUsers,
+    });
+  } catch (error) {
+    console.error("Error fetching admin revenue:", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch admin revenue",
       details: error.message,
     });
   }
@@ -332,10 +579,11 @@ const getGlobalLogs = async (req, res) => {
 const getAuditLogs = async (req, res) => {
   try {
     const { page, limit, skip } = normalizePagination(req.query);
+    const { userId } = req.params;
     const filter = {};
 
-    if (req.query.userId && mongoose.Types.ObjectId.isValid(req.query.userId)) {
-      filter.userId = req.query.userId;
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      filter.userId = userId;
     }
 
     const [logs, total] = await Promise.all([
@@ -371,6 +619,9 @@ module.exports = {
   getAdminHistory,
   getAdminUsers,
   updateUserRole,
+  updateUserAccess,
+  getFinanceSummary,
+  getAdminRevenue,
   getFeedbackTickets,
   resolveFeedbackTicket,
   syncAiKnowledge,

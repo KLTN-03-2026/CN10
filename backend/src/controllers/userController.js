@@ -1,5 +1,5 @@
 const User = require("../models/User");
-const Feedback = require("../models/Feedback");
+const { encryptString } = require("../utils/crypto");
 
 /**
  * Update current user settings
@@ -55,55 +55,66 @@ const updateUserSettings = async (req, res) => {
 };
 
 /**
- * Submit user feedback
- * @route POST /api/feedback
- * @headers Authorization: Bearer <token>
- * @body {string} message
+ * PUT /api/users/byok
+ * Save or remove encrypted Gemini API key for PRO users.
  */
-const submitFeedback = async (req, res) => {
+const updateByokSettings = async (req, res) => {
   try {
     const userId = req.user?.userId || req.user?.id;
-    const { message } = req.body;
+    const { geminiApiKey, clear } = req.body || {};
 
-    if (!userId) {
-      return res.status(401).json({
-        error: "User context is missing",
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    if (user.role !== "USER") {
+      return res.status(403).json({
+        error: "BYOK is only available in client workspace",
       });
     }
 
-    if (!message || typeof message !== "string" || !message.trim()) {
+    if (user.tier !== "PRO") {
+      return res.status(403).json({
+        error: "BYOK is available for PRO users only",
+        code: "PRO_REQUIRED",
+      });
+    }
+
+    if (clear === true) {
+      user.encryptedGeminiApiKey = null;
+      await user.save();
+
+      return res.status(200).json({
+        success: true,
+        message: "BYOK removed successfully",
+        hasCustomGeminiKey: false,
+      });
+    }
+
+    if (typeof geminiApiKey !== "string" || !geminiApiKey.trim()) {
+      return res.status(400).json({ error: "geminiApiKey is required" });
+    }
+
+    const normalizedKey = geminiApiKey.trim();
+    if (normalizedKey.length < 20) {
       return res.status(400).json({
-        error: "message is required",
+        error: "geminiApiKey appears invalid",
       });
     }
 
-    const normalizedMessage = message.trim();
-    if (normalizedMessage.length < 3 || normalizedMessage.length > 5000) {
-      return res.status(400).json({
-        error: "message must be between 3 and 5000 characters",
-      });
-    }
+    user.encryptedGeminiApiKey = encryptString(normalizedKey);
+    await user.save();
 
-    const feedback = await Feedback.create({
-      userId,
-      message: normalizedMessage,
-      status: "PENDING",
-    });
-
-    return res.status(201).json({
+    return res.status(200).json({
       success: true,
-      message: "Feedback submitted successfully",
-      feedback: {
-        id: feedback._id,
-        userId: feedback.userId,
-        status: feedback.status,
-        createdAt: feedback.createdAt,
-      },
+      message: "BYOK saved securely",
+      hasCustomGeminiKey: true,
     });
   } catch (error) {
-    console.error("Error submitting feedback:", error.message);
+    console.error("Error updating BYOK settings:", error.message);
     return res.status(500).json({
-      error: "Failed to submit feedback",
+      error: "Failed to update BYOK settings",
       details: error.message,
     });
   }
@@ -111,5 +122,5 @@ const submitFeedback = async (req, res) => {
 
 module.exports = {
   updateUserSettings,
-  submitFeedback,
+  updateByokSettings,
 };
